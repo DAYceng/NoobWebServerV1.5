@@ -1,0 +1,33 @@
+.PHONY: all
+all: oj_server compile_server webserver
+
+CC=g++
+CFLAGS=-std=c++11 -Wall -g
+INCLUDE=-I./oj_server -I./comm
+LIB=-lpthread -lmysqlcppconn
+
+OBJS=./oj_server/oj_server.o ./oj_server/oj_model.o ./oj_model2.o \
+     ./oj_server/oj_control.o ./oj_server/oj_view.o \
+     ./comm/util.o ./comm/log.o ./comm/httplib.o \
+     ./compile_server/compile_server.o ./compile_server/compiler.o \
+     ./compile_server/compile_run.o ./compile_server/runner.o \
+     ./webserver.o ./config.o ./http/http_conn.o \
+     ./CGImysql/sql_connection_pool.o ./lock/locker.o \
+     ./log/log.o ./timer/lst_timer.o ./threadpool/threadpool.o
+
+oj_server:
+	make -C oj_server
+
+compile_server:
+	make -C compile_server
+
+webserver: $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LIB)
+
+%.o:%.cpp
+	$(CC) $(CFLAGS) -c $< -o $@ $(INCLUDE)
+
+clean:
+	make clean -C oj_server
+	make clean -C compile_server
+	rm -rf ./webserver *.o
