@@ -299,3 +299,292 @@ namespace ns_runner{
     };
 }
 ```
+## 整合编译运行服务
+
+前面我们分别实现了OJ的编译和代码运行服务，现在我们需要调用这两个服务去处理用户提交的代码
+
+老规矩，先来看一下这部分结构
+
+```c++
+#pragma once
+
+#include "compiler.hpp"
+#include "runner.hpp"
+#include "../comm/log.hpp"
+#include "../comm/util.hpp"
+
+#include <signal.h>
+#include <unistd.h>
+#include <jsoncpp/json/json.h>
+
+namespace ns_compile_and_run{
+    using namespace ns_log;
+    using namespace ns_util;
+    using namespace ns_compiler;
+    using namespace ns_runner;
+
+    class CompileAndRun{
+    public:
+        static void RemoveTempFile(const std::string &file_name){}     
+        static std::string CodeToDesc(int code, const std::string &file_name){}      
+        static void Start(const std::string &in_json, std::string *out_json){}
+    };
+}
+```
+
+整合服务中定义了一个主类CompileAndRun，提供了编译、运行、清理临时文件等功能。该类中实现了RemoveTempFile、CodeToDesc和Start三个成员函数
+
+分别来看
+
+### 文件清理RemoveTempFile
+
+`RemoveTempFile`方法用于清理编译运行过程中生成的临时文件，包括源代码文件、编译错误文件、可执行文件、输入文件、输出文件和错误输出文件等。该方法根据文件名的不同来判断文件类型，并删除对应的文件。
+
+```c++
+		static void RemoveTempFile(const std::string &file_name){
+            //清理文件的个数是不确定的，但是有哪些我们是知道的
+            std::string _src = PathUtil::Src(file_name);
+            if(FileUtil::IsFileExists(_src)) unlink(_src.c_str());
+
+            std::string _compiler_error = PathUtil::CompilerError(file_name);
+            if(FileUtil::IsFileExists(_compiler_error)) unlink(_compiler_error.c_str());
+
+            std::string _execute = PathUtil::Exe(file_name);
+            if(FileUtil::IsFileExists(_execute)) unlink(_execute.c_str());
+
+            std::string _stdin = PathUtil::Stdin(file_name);
+            if(FileUtil::IsFileExists(_stdin)) unlink(_stdin.c_str());
+
+            std::string _stdout = PathUtil::Stdout(file_name);
+            if(FileUtil::IsFileExists(_stdout)) unlink(_stdout.c_str());
+
+            std::string _stderr = PathUtil::Stderr(file_name);
+            if(FileUtil::IsFileExists(_stderr)) unlink(_stderr.c_str());
+        }
+		...
+```
+
+通过`PathUtil::Src`解析获取文件名，然后使用`FileUtil::IsFileExists`判断该文件是否存在，存在就使用`unlink`函数删除该文件
+
+其余的同理，使用`PathUtil`中对应的功能函数获取对应文件的文件名，然后将其删除即可
+
+> `unlink()`是一个用于删除文件或符号链接的系统调用函数。它通常用于在程序中删除不再需要的文件。
+>
+> `unlink()` 函数只能删除文件或符号链接，而不能删除目录。如果要删除目录，可以使用 `rmdir()` 函数。
+>
+> 在使用 `unlink()` 函数删除文件时，应该确保文件已经被关闭，否则可能会导致文件系统损坏或数据丢失的风险。
+
+### 生成错误码CodeToDesc
+
+`CodeToDesc`方法用于将编译运行过程中产生的错误码转换为相应的错误描述。根据错误码的不同，该方法返回不同的错误描述信息。
+
+例如，当错误码为0时，返回编译运行成功；当错误码为-3时，返回编译错误信息等。
+
+```c++
+		static std::string CodeToDesc(int code, const std::string &file_name){
+            std::string desc;
+            switch (code){
+            case 0:
+                desc = "编译运行成功";
+                break;
+            case -1:
+                desc = "提交的代码是空";
+                break;
+            ...
+            return desc;
+        }
+```
+
+当产生编译错误，也就是错误码-3时，需要使用`FileUtil::ReadFile`来获取编译错误信息，并将其存储到一个字符串中。
+
+```c++
+		static bool ReadFile(const std::string &target, std::string *content, bool keep = false){
+            (*content).clear();//清空传入的字符串指针所指向的内容
+
+            std::ifstream in(target);//读取文件的输入流类。in是该类对象的一个实例，用于读取文件target。
+            if (!in.is_open()){//创建了一个std::ifstream对象in，并打开了文件target。
+                return false;
+            }
+            std::string line;
+            // getline:不保存行分割符,有些时候需要保留\n,
+            // getline内部重载了强制类型转化
+            while (std::getline(in, line)){//逐行读取文件中的内容
+                (*content) += line;//并将每一行拼接到传入的字符串指针所指向的字符串末尾。
+                (*content) += (keep ? "\n" : "");
+            }
+            in.close();
+            return true;
+        }
+```
+
+### 入口函数Start
+
+`Start`方法是编译运行部分的入口函数，它接收一个包含用户提交的代码、输入数据、时间和空间限制的JSON字符串作为输入，执行编译、运行等操作，并返回一个包含状态码、错误信息、标准输出和错误输出等信息的JSON字符串。
+
+```c++
+		static void Start(const std::string &in_json, std::string *out_json){
+            Json::Value in_value;
+            Json::Reader reader;
+            reader.parse(in_json, in_value); //最后在处理差错问题
+
+            std::string code = in_value["code"].asString();
+            std::string input = in_value["input"].asString();
+            int cpu_limit = in_value["cpu_limit"].asInt();
+            int mem_limit = in_value["mem_limit"].asInt();
+
+            int status_code = 0;
+            Json::Value out_value;
+            int run_result = 0;
+            std::string file_name; //需要内部形成的唯一文件名
+			...
+        }
+```
+
+上述代码使用了JSON库，将输入的JSON字符串in_json解析为Json::Value类型的in_value变量。
+
+代码从in_value中分别读取了四个字段：
+
+```c++
+code：以字符串形式存储的代码内容。
+input：以字符串形式存储的输入数据。
+cpu_limit：以整数形式存储的CPU限制。
+mem_limit：以整数形式存储的内存限制。
+```
+
+上述字符串其实就是我们从网页获取到的用户提交的代码，这些代码和输入以json格式提交
+
+（加个图）
+
+接下来，通过判断字符串内容进行对应的处理
+
+```c++
+			...
+			if (code.size() == 0){
+                status_code = -1; //代码为空
+                goto END;
+            }
+            // 形成的文件名只具有唯一性，没有目录没有后缀
+            // 毫秒级时间戳+原子性递增唯一值: 来保证唯一性
+            file_name = FileUtil::UniqFileName();
+            if (!FileUtil::WriteFile(PathUtil::Src(file_name), code)){//形成临时src文件
+                status_code = -2; //未知错误
+                goto END;
+            }
+			...         
+```
+
+如果获取到的代码为空，直接跳转到END结束整个流程
+
+然后需要调用`FileUtil::UniqFileName`获取一个毫秒级时间戳，UniqFileName中定义了一个名为id的静态std::atomic_uint类型的变量，初始值为0。我们可以原子地更新其值，从而保证线程安全。（即保证文件名的唯一性）
+
+然后使用`FileUtil::WriteFile`将当前得到的code写入一个临时文件file_name中，出错就返回-2并直接跳转到END
+
+没出错，调用编译服务Compile对拿到的代码进行编译，同样的，出错就报错
+
+```c++
+			...
+			if (!Compiler::Compile(file_name)){//编译失败                
+                status_code = -3; //代码编译的时候发生了错误
+                goto END;
+            }
+			...
+```
+
+没出错，调用运行服务Run运行编译完成的代码。判断一下返回的状态码并做相应的处理
+
+```c++
+			...
+			run_result = Runner::Run(file_name, cpu_limit, mem_limit);
+            if (run_result < 0) status_code = -2; //未知错误
+            else if (run_result > 0) status_code = run_result;//程序运行崩溃了
+            else status_code = 0;//运行成功
+			...
+```
+
+走完编译-运行的流程后，将获取到的状态码status_code和生成的错误码加入输出json文件out_value中
+
+```c++
+        END:
+            out_value["status"] = status_code;
+            out_value["reason"] = CodeToDesc(status_code, file_name);
+            if (status_code == 0){// 整个过程全部成功
+                std::string _stdout;
+                FileUtil::ReadFile(PathUtil::Stdout(file_name), &_stdout, true);
+                out_value["stdout"] = _stdout;
+
+                std::string _stderr;
+                FileUtil::ReadFile(PathUtil::Stderr(file_name), &_stderr, true);
+                out_value["stderr"] = _stderr;
+            }
+
+            Json::StyledWriter writer;
+            *out_json = writer.write(out_value);
+
+            RemoveTempFile(file_name);
+        }
+    };
+}
+```
+
+如果整个过程没报错，使用`FileUtil::ReadFile()`函数读取程序运行的标准输出和标准错误输出。
+
+将源代码编译成功并运行后，程序的标准输出和标准错误输出分别被写入到了临时的文件中，分别对应`PathUtil::Stdout(file_name)`和`PathUtil::Stderr(file_name)`的路径。因此，可以使用`FileUtil::ReadFile()`函数读取这两个文件的内容，再将它们存储到输出的`out_value`（一个JSON对象）中的`stdout`和`stderr`字段中。
+
+然后使用JsonCpp库将out_value写入out_json。
+
+## 打包网络服务
+
+整合完编译运行服务后，我们需要将其挂到web服务器上，形成一个外界可以访问并与之交互的网络应用服务
+
+这部分在`compile_server.cc`中编写
+
+```c++
+#include "compile_run.hpp"
+#include "../comm/httplib.h"
+
+using namespace ns_compile_and_run;
+using namespace httplib;
+
+int main(int argc, char *argv[]){
+    return 0;
+}
+```
+
+这里我们使用的服务器是cpp-httplib（先使用cpp-httplib进行功能测试，后续全部替换为自己写的服务器）
+
+首先，在`main`函数中创建了一个`httplib::Server`对象`svr`，它是一个HTTP服务器对象。
+
+```c++
+int main(int argc, char *argv[]){
+    Server svr;
+    return 0;
+}
+```
+
+然后，使用`svr.Post()`方法来创建一个**POST**请求的处理程序。
+
+这个处理程序接收HTTP请求的正文（即用户提交的代码），并将其作为参数传递给`CompileAndRun::Start()`方法，该方法进行代码编译和运行，并将结果存储在一个JSON字符串中。最后，将这个JSON字符串设置为HTTP响应的正文，以便返回给用户。
+
+```c++
+int main(int argc, char *argv[]){
+    Server svr;
+    svr.Post("/compile_and_run", [](const Request &req, Response &resp){
+        // 用户请求的服务正文是我们想要的json string
+        std::string in_json = req.body;
+        std::string out_json;
+        if(!in_json.empty()){
+            CompileAndRun::Start(in_json, &out_json);
+            resp.set_content(out_json, "application/json;charset=utf-8");
+        }
+    });
+    return 0;
+}
+```
+
+`"/compile_and_run"`是该POST请求要处理的路径，而`[](const Request &req, Response &resp){...}`是该POST请求的处理函数，其中`req`表示客户端发送的请求，`resp`表示服务器要返回给客户端的响应。
+
+`std::string in_json = req.body;`表示从客户端请求中获取到的POST请求正文，也就是用户提交的代码。接下来，`CompileAndRun::Start(in_json, &out_json);`会将这段代码编译并运行，并将结果存储在`out_json`中，最后将`out_json`作为服务器的响应返回给客户端。
+
+然后为服务器绑定一个端口即可，我们还可以定义一个函数来返回当前使用的端口
+
+
