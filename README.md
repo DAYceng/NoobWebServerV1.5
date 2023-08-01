@@ -1,5 +1,4 @@
 # NoobWebServerV1.5
-a webserver
 这是一个web服务器（仅用于学习Linux socket编程和计算机网络），具有以下特点：
 
 * 使用非阻塞IO实现了reactor网络模型；
